@@ -150,6 +150,8 @@ void main() {
         float speed = length(myVel);
         if (speed > u_maxSpeed)
             myVel = normalize(myVel) * u_maxSpeed;
+        else if (speed < u_maxSpeed * 0.1 && speed > 0.0001)
+            myVel = normalize(myVel) * u_maxSpeed * 0.1; // minimum speed so boids keep swimming
 
     } else {
         // ---- Predator: chase flock centroid ----
@@ -379,6 +381,13 @@ void GLViewBoidSwarm::initComputeShader()
 {
    GLuint cs = compileShader( GL_COMPUTE_SHADER, computeShaderSource );
    computeProgram = linkProgram( &cs, 1 );
+
+   GLint linkOk = 0;
+   glGetProgramiv( computeProgram, GL_LINK_STATUS, &linkOk );
+   if( linkOk )
+      std::cout << "Compute shader linked OK (program " << computeProgram << ")" << std::endl;
+   else
+      std::cout << "*** COMPUTE SHADER LINK FAILED ***" << std::endl;
 }
 
 void GLViewBoidSwarm::initRenderShader()
@@ -387,6 +396,13 @@ void GLViewBoidSwarm::initRenderShader()
    shaders[0] = compileShader( GL_VERTEX_SHADER, boidVertexShaderSource );
    shaders[1] = compileShader( GL_FRAGMENT_SHADER, boidFragmentShaderSource );
    renderProgram = linkProgram( shaders, 2 );
+
+   GLint linkOk = 0;
+   glGetProgramiv( renderProgram, GL_LINK_STATUS, &linkOk );
+   if( linkOk )
+      std::cout << "Render shader linked OK (program " << renderProgram << ")" << std::endl;
+   else
+      std::cout << "*** RENDER SHADER LINK FAILED ***" << std::endl;
 }
 
 void GLViewBoidSwarm::initBoidBuffers()
@@ -435,7 +451,10 @@ void GLViewBoidSwarm::resetSimulation()
    for( int i = 0; i < n; ++i )
    {
       Vector p = randVecInSphere( 15.0f );
-      Vector v = randVecInSphere( 0.1f );
+      Vector v = randVecInSphere( 0.2f );
+      // Ensure non-zero initial velocity so boids start moving
+      if( v.x * v.x + v.y * v.y + v.z * v.z < 0.01f )
+         v = Vector( 0.1f, 0.1f, 0.0f );
       data[i] = { p.x, p.y, p.z, 0.0f, v.x, v.y, v.z, 0.0f };
    }
    // Predator (last element)
@@ -532,6 +551,10 @@ void GLViewBoidSwarm::renderBoids()
    Mat4 view = this->cam->getCameraViewMatrix();
    Mat4 proj = this->cam->getCameraProjectionMatrix();
 
+   // Clear only depth buffer so boids aren't occluded by the aquarium sphere
+   // (the aquarium WO rendered in the main pass writes depth)
+   glClear( GL_DEPTH_BUFFER_BIT );
+
    glUseProgram( renderProgram );
 
    glUniformMatrix4fv( glGetUniformLocation( renderProgram, "u_view" ), 1, GL_FALSE, view.getPtr() );
@@ -541,6 +564,7 @@ void GLViewBoidSwarm::renderBoids()
    glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 0, ssbo[readIdx] );
 
    glEnable( GL_DEPTH_TEST );
+   glDepthMask( GL_TRUE );
    glBindVertexArray( boidVAO );
 
    // Draw boids: teal, small

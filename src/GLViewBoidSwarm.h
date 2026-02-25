@@ -4,32 +4,27 @@
 #include "AftrImGui_MenuBar.h"
 #include "AftrImGui_WO_Editor.h"
 #include "AftrImGui_BoidSwarm.h"
+#include "Vector.h"
+#include <vector>
 
 namespace Aftr
 {
    class Camera;
    class WOImGui;
 
-/**
-   \class GLViewBoidSwarm
-   \author Scott Nykl 
-   \brief A child of an abstract GLView. This class is the top-most manager of the module.
-
-   Read \see GLView for important constructor and init information.
-
-   \see GLView
-
-    \{
-*/
+struct Boid {
+   WO* wo = nullptr;
+   Vector vel;
+   Vector acc;
+};
 
 class GLViewBoidSwarm : public GLView
 {
 public:
    static GLViewBoidSwarm* New( const std::vector< std::string >& outArgs );
    virtual ~GLViewBoidSwarm();
-   virtual void updateWorld() override; ///< Called once per frame
-   virtual void loadMap() override; ///< Called once at startup to build this module's scene
-   virtual void createBoidSwarmWayPoints();
+   virtual void updateWorld() override;
+   virtual void loadMap() override;
    virtual void onResizeWindow( GLsizei width, GLsizei height ) override;
    virtual void onMouseDown( const SDL_MouseButtonEvent& e ) override;
    virtual void onMouseUp( const SDL_MouseButtonEvent& e ) override;
@@ -41,14 +36,20 @@ protected:
    GLViewBoidSwarm( const std::vector< std::string >& args );
    virtual void onCreate();
 
-   WOImGui* gui = nullptr; //The GUI which contains all ImGui widgets
-   AftrImGui_MenuBar menu;      //The Menu bar at the top of the GUI window
-   AftrImGui_WO_Editor wo_editor;//The WO Editor to mutate a selected WO
-   AftrImGui_BoidSwarm orbit_gui;
-   WO* moon = nullptr;
-   WO* gulfstream = nullptr;
-};
+   WO* createBoidWO( float scale, aftrColor4ub color );
+   void spawnBoids();
+   void updateBoids();
+   void orientToVelocity( WO* wo, const Vector& pos, const Vector& vel );
 
-/** \} */
+   WOImGui* gui = nullptr;
+   AftrImGui_MenuBar menu;
+   AftrImGui_WO_Editor wo_editor;
+   AftrImGui_BoidSwarm boid_gui;
+
+   std::vector< Boid > boids;
+   Boid predator;
+
+   static constexpr int INITIAL_BOID_COUNT = 50;
+};
 
 } //namespace Aftr

@@ -1,58 +1,43 @@
 #include "AftrImGui_BoidSwarm.h"
 #include "AftrImGuiIncludes.h"
-#include <fmt/core.h>
-#include <chrono>
 
 void Aftr::AftrImGui_BoidSwarm::draw()
 {
-   this->draw_orbit_controls();
+   this->draw_boid_controls();
 }
 
-void Aftr::AftrImGui_BoidSwarm::draw_orbit_controls()
+void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
 {
-   if( ImGui::Begin( "Moon Spy" ) )
+   if( ImGui::Begin( "Boid Controls" ) )
    {
-      if( ImGui::Button( ( this->isPaused ? "Resume Motion" : "Pause Motion" ) ) )
-      {
+      // Simulation controls
+      if( ImGui::Button( this->isPaused ? "Resume" : "Pause" ) )
          this->isPaused = !this->isPaused;
-         if( this->isPaused )
-            this->pause_time = std::chrono::system_clock::now();
-         else
-            this->start_time = (std::chrono::system_clock::now() - pause_time) + start_time;
-         fmt::print( "Moon Orbiter Status: {:b}...\n", this->isPaused );
-      }
 
-      if( ImGui::SliderFloat( "Radius (m)", &this->radius_m, 1.0f, 100.0f ) )
-         fmt::print( "Adjusted Moon Orbiter radius to {:f} meters... Good job...\n", this->radius_m );
+      ImGui::SameLine();
+      if( ImGui::Button( "Reset Swarm" ) )
+         this->resetRequested = true;
 
-      if( ImGui::SliderInt( "Orbit time (msec)", &this->orbitTime_msec, 50, 10000 ) )
-         fmt::print( "Adjusted Moon Orbiter time to {:d} milliseconds... Better job...\n", this->orbitTime_msec );
+      ImGui::Separator();
+      ImGui::Text( "Flocking Weights" );
+      ImGui::SliderFloat( "Separation", &this->separationWeight, 0.0f, 5.0f );
+      ImGui::SliderFloat( "Alignment", &this->alignmentWeight, 0.0f, 5.0f );
+      ImGui::SliderFloat( "Cohesion", &this->cohesionWeight, 0.0f, 5.0f );
+      ImGui::SliderFloat( "Boundary", &this->boundaryWeight, 0.0f, 10.0f );
+      ImGui::SliderFloat( "Flee", &this->fleeWeight, 0.0f, 10.0f );
+
+      ImGui::Separator();
+      ImGui::Text( "Radii" );
+      ImGui::SliderFloat( "Separation Radius", &this->separationRadius, 0.5f, 10.0f );
+      ImGui::SliderFloat( "Neighbor Radius", &this->neighborRadius, 1.0f, 20.0f );
+      ImGui::SliderFloat( "Fear Radius", &this->fearRadius, 2.0f, 30.0f );
+      ImGui::SliderFloat( "Boundary Radius", &this->boundaryRadius, 10.0f, 100.0f );
+
+      ImGui::Separator();
+      ImGui::Text( "Speed" );
+      ImGui::SliderFloat( "Max Boid Speed", &this->maxSpeed, 0.05f, 1.0f );
+      ImGui::SliderFloat( "Predator Speed", &this->predatorSpeed, 0.02f, 0.5f );
 
       ImGui::End();
    }
-}
-
-Aftr::Mat4 Aftr::AftrImGui_BoidSwarm::compute_pose( Mat4 const& origin )
-{
-   if( !this->isPaused )
-      this->now_time = std::chrono::system_clock::now();
-
-   //one revolution completes in exactly REV_TIME, compute parametric offset based on the current time
-   std::chrono::duration REV_TIME = std::chrono::milliseconds( this->orbitTime_msec );
-
-   auto delta_t = std::chrono::duration<float>( now_time - start_time );
-   float t = float( delta_t / REV_TIME ); //parametric distance [0,1], between start time and now
-   //fmt::print( "Num revolutions is {:f}\n", t);
-
-   //Compute the pose of the orbiting object -- the position and the orientation
-   Vector pos = origin.getPosition();
-   Vector fwdVec = origin.getX();
-   Vector upVec = origin.getZ();
-   Vector orbit_pos = pos + (fwdVec * radius_m).rotate( upVec, t * Aftr::PI * 2.0f );
-   Vector relX = (pos - orbit_pos).normalizeMe();
-   Vector relY = upVec.crossProduct( relX );
-   Vector relZ = relX.crossProduct( relY );
-   Mat4 pose( relX, relY, relZ );
-   pose.setPosition( orbit_pos );
-   return pose;
 }

@@ -464,11 +464,12 @@ void GLViewBoidSwarm::resetSimulation()
 
    GLsizeiptr bufSize = total * sizeof( BoidGPU );
 
+   // Initialize BOTH SSBOs with the same data so ping-pong never reads garbage
    glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[0] );
    glBufferData( GL_SHADER_STORAGE_BUFFER, bufSize, data.data(), GL_DYNAMIC_DRAW );
 
    glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[1] );
-   glBufferData( GL_SHADER_STORAGE_BUFFER, bufSize, nullptr, GL_DYNAMIC_DRAW );
+   glBufferData( GL_SHADER_STORAGE_BUFFER, bufSize, data.data(), GL_DYNAMIC_DRAW );
 
    glBindBuffer( GL_SHADER_STORAGE_BUFFER, 0 );
    readIdx = 0;
@@ -529,8 +530,31 @@ void GLViewBoidSwarm::updateWorld()
    // Dispatch one thread per entity
    glDispatchCompute( ( n + 1 + 255 ) / 256, 1, 1 );
 
-   // Barrier: ensure compute writes are visible to vertex shader reads
-   glMemoryBarrier( GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT );
+   // Barrier: ensure compute writes are visible to subsequent reads
+   glMemoryBarrier( GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT );
+
+   // One-time diagnostic: read back a boid position to verify compute is running
+   static int debugFrameCount = 0;
+   if( debugFrameCount < 3 )
+   {
+      glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[writeIdx] );
+      BoidGPU* mapped = (BoidGPU*)glMapBufferRange( GL_SHADER_STORAGE_BUFFER, 0,
+                        3 * sizeof( BoidGPU ), GL_MAP_READ_BIT );
+      if( mapped )
+      {
+         std::cout << "Frame " << debugFrameCount << " compute output boid[0]: pos=("
+                   << mapped[0].px << "," << mapped[0].py << "," << mapped[0].pz
+                   << ") vel=(" << mapped[0].vx << "," << mapped[0].vy << "," << mapped[0].vz
+                   << ")" << std::endl;
+         glUnmapBuffer( GL_SHADER_STORAGE_BUFFER );
+      }
+      else
+      {
+         std::cout << "Frame " << debugFrameCount << " FAILED to map SSBO for readback!" << std::endl;
+      }
+      glBindBuffer( GL_SHADER_STORAGE_BUFFER, 0 );
+      debugFrameCount++;
+   }
 
    // Swap buffers
    readIdx = writeIdx;

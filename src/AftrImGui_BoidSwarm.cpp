@@ -10,12 +10,16 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
 {
    if( ImGui::Begin( "Boid Controls" ) )
    {
-      // Simulation controls
       if( ImGui::Button( this->isPaused ? "Resume" : "Pause" ) )
          this->isPaused = !this->isPaused;
 
       ImGui::SameLine();
       if( ImGui::Button( "Reset Swarm" ) )
+         this->resetRequested = true;
+
+      ImGui::Separator();
+      ImGui::Text( "Swarm Size" );
+      if( ImGui::SliderInt( "Num Boids", &this->numBoids, 100, 5000 ) )
          this->resetRequested = true;
 
       ImGui::Separator();
@@ -25,6 +29,7 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
       ImGui::SliderFloat( "Cohesion", &this->cohesionWeight, 0.0f, 5.0f );
       ImGui::SliderFloat( "Boundary", &this->boundaryWeight, 0.0f, 10.0f );
       ImGui::SliderFloat( "Flee", &this->fleeWeight, 0.0f, 10.0f );
+      ImGui::SliderFloat( "Obstacle", &this->obstacleWeight, 0.0f, 10.0f );
 
       ImGui::Separator();
       ImGui::Text( "Radii" );

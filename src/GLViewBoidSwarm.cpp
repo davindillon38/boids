@@ -22,12 +22,314 @@
 #include "AftrImGuiIncludes.h"
 #include "AftrGLRendererBase.h"
 #include "MGLIndexedGeometry.h"
-#include "IndexedGeometryTriangles.h"
+#include "IndexedGeometrySphereTriStrip.h"
+#include "ManagerEnvironmentConfiguration.h"
 
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
+#include <vector>
+#include <iostream>
 
 using namespace Aftr;
+
+// ============================================================
+// GLSL Shader Sources (inline, following ChaosGame pattern)
+// ============================================================
+
+static const char* computeShaderSource = R"(
+#version 430
+layout(local_size_x = 256) in;
+
+struct BoidData {
+    vec4 pos; // xyz=position, w=type (0=boid, 1=predator)
+    vec4 vel; // xyz=velocity, w=unused
+};
+
+layout(std430, binding = 0) readonly  buffer BoidInput  { BoidData boidsIn[];  };
+layout(std430, binding = 1)           buffer BoidOutput { BoidData boidsOut[]; };
+
+uniform int   u_numBoids;
+uniform float u_sepWeight;
+uniform float u_aliWeight;
+uniform float u_cohWeight;
+uniform float u_bndWeight;
+uniform float u_fleWeight;
+uniform float u_obsWeight;
+uniform float u_sepRadius;
+uniform float u_neiRadius;
+uniform float u_feaRadius;
+uniform float u_bndRadius;
+uniform float u_maxSpeed;
+uniform float u_predSpeed;
+uniform float u_dt;
+uniform int   u_numObstacles;
+uniform vec4  u_obstacles[3]; // xyz=position, w=avoidance radius
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint totalEntities = uint(u_numBoids) + 1u;
+    if (idx >= totalEntities) return;
+
+    vec3 myPos = boidsIn[idx].pos.xyz;
+    vec3 myVel = boidsIn[idx].vel.xyz;
+    bool isPredator = (idx == uint(u_numBoids));
+
+    vec3 acc = vec3(0.0);
+
+    if (!isPredator) {
+        // ---- Boid flocking rules ----
+        vec3 separation = vec3(0.0);
+        vec3 alignSum   = vec3(0.0);
+        vec3 cohesionSum = vec3(0.0);
+        int sepCount = 0;
+        int neiCount = 0;
+
+        for (uint j = 0u; j < uint(u_numBoids); ++j) {
+            if (j == idx) continue;
+            vec3 other = boidsIn[j].pos.xyz;
+            vec3 diff  = myPos - other;
+            float dist = length(diff);
+
+            // Separation
+            if (dist < u_sepRadius && dist > 0.001) {
+                float strength = (u_sepRadius - dist) / u_sepRadius;
+                separation += normalize(diff) * strength;
+                sepCount++;
+            }
+
+            // Alignment + Cohesion
+            if (dist < u_neiRadius) {
+                alignSum   += boidsIn[j].vel.xyz;
+                cohesionSum += other;
+                neiCount++;
+            }
+        }
+
+        if (sepCount > 0)
+            acc += separation * u_sepWeight;
+
+        if (neiCount > 0) {
+            vec3 avgVel = alignSum / float(neiCount);
+            acc += (avgVel - myVel) * u_aliWeight;
+
+            vec3 center = cohesionSum / float(neiCount);
+            acc += (center - myPos) * u_cohWeight;
+        }
+
+        // Boundary containment
+        float distOrigin = length(myPos);
+        if (distOrigin > u_bndRadius) {
+            float overshoot = distOrigin - u_bndRadius;
+            acc += (-myPos / distOrigin) * overshoot * u_bndWeight;
+        }
+
+        // Predator avoidance
+        vec3 predPos  = boidsIn[u_numBoids].pos.xyz;
+        vec3 predDiff = myPos - predPos;
+        float predDist = length(predDiff);
+        if (predDist < u_feaRadius && predDist > 0.001) {
+            float strength = (u_feaRadius - predDist) / predDist;
+            acc += normalize(predDiff) * strength * u_fleWeight;
+        }
+
+        // Obstacle avoidance
+        for (int o = 0; o < u_numObstacles; ++o) {
+            vec3  obsPos    = u_obstacles[o].xyz;
+            float obsRadius = u_obstacles[o].w;
+            vec3  obsDiff   = myPos - obsPos;
+            float obsDist   = length(obsDiff);
+            if (obsDist < obsRadius && obsDist > 0.001) {
+                float strength = (obsRadius - obsDist) / obsDist;
+                acc += normalize(obsDiff) * strength * u_obsWeight;
+            }
+        }
+
+        // Integrate
+        myVel += acc * u_dt;
+        float speed = length(myVel);
+        if (speed > u_maxSpeed)
+            myVel = normalize(myVel) * u_maxSpeed;
+
+    } else {
+        // ---- Predator: chase flock centroid ----
+        vec3 centroid = vec3(0.0);
+        for (uint j = 0u; j < uint(u_numBoids); ++j)
+            centroid += boidsIn[j].pos.xyz;
+        centroid /= float(u_numBoids);
+
+        vec3 toCentroid = centroid - myPos;
+        float dist = length(toCentroid);
+        if (dist > 0.01)
+            acc = normalize(toCentroid) * 0.5;
+
+        // Boundary
+        float distOrigin = length(myPos);
+        if (distOrigin > u_bndRadius) {
+            float overshoot = distOrigin - u_bndRadius;
+            acc += (-myPos / distOrigin) * overshoot * u_bndWeight;
+        }
+
+        // Obstacle avoidance
+        for (int o = 0; o < u_numObstacles; ++o) {
+            vec3  obsPos    = u_obstacles[o].xyz;
+            float obsRadius = u_obstacles[o].w;
+            vec3  obsDiff   = myPos - obsPos;
+            float obsDist   = length(obsDiff);
+            if (obsDist < obsRadius && obsDist > 0.001) {
+                float strength = (obsRadius - obsDist) / obsDist;
+                acc += normalize(obsDiff) * strength * u_obsWeight;
+            }
+        }
+
+        myVel += acc * u_dt;
+        float speed = length(myVel);
+        if (speed > u_predSpeed)
+            myVel = normalize(myVel) * u_predSpeed;
+    }
+
+    myPos += myVel;
+
+    boidsOut[idx].pos = vec4(myPos, boidsIn[idx].pos.w);
+    boidsOut[idx].vel = vec4(myVel, 0.0);
+}
+)";
+
+static const char* boidVertexShaderSource = R"(
+#version 430
+
+layout(location = 0) in vec3 aVertex;
+
+struct BoidData {
+    vec4 pos;
+    vec4 vel;
+};
+
+layout(std430, binding = 0) readonly buffer BoidBuffer {
+    BoidData boids[];
+};
+
+uniform mat4  u_view;
+uniform mat4  u_proj;
+uniform float u_scale;
+uniform int   u_instanceOffset;
+uniform vec4  u_color;
+
+out vec3 vNormal;
+out vec4 vColor;
+
+mat3 rotationFromVelocity(vec3 vel) {
+    float speed = length(vel);
+    if (speed < 0.0001) return mat3(1.0);
+
+    vec3 fwd = vel / speed;
+    vec3 upHint = vec3(0.0, 0.0, 1.0);
+    if (abs(dot(fwd, upHint)) > 0.99)
+        upHint = vec3(0.0, 1.0, 0.0);
+
+    vec3 right = normalize(cross(fwd, upHint));
+    vec3 up    = cross(right, fwd);
+
+    return mat3(fwd, right, up);
+}
+
+void main() {
+    int boidIdx = gl_InstanceID + u_instanceOffset;
+    vec3 boidPos = boids[boidIdx].pos.xyz;
+    vec3 boidVel = boids[boidIdx].vel.xyz;
+
+    mat3 rot = rotationFromVelocity(boidVel);
+    vec3 worldPos = boidPos + rot * (aVertex * u_scale);
+
+    gl_Position = u_proj * u_view * vec4(worldPos, 1.0);
+
+    vNormal = rot * normalize(aVertex);
+    vColor  = u_color;
+}
+)";
+
+static const char* boidFragmentShaderSource = R"(
+#version 430
+
+in vec3 vNormal;
+in vec4 vColor;
+out vec4 FragColor;
+
+void main() {
+    vec3 lightDir = normalize(vec3(0.3, 0.3, 1.0));
+    float diffuse = max(dot(normalize(vNormal), lightDir), 0.0);
+    float ambient = 0.35;
+    float lighting = ambient + diffuse * 0.65;
+
+    FragColor = vec4(vColor.rgb * lighting, vColor.a);
+}
+)";
+
+// ============================================================
+// Helpers
+// ============================================================
+
+static GLuint compileShader( GLenum type, const char* source )
+{
+   GLuint shader = glCreateShader( type );
+   glShaderSource( shader, 1, &source, nullptr );
+   glCompileShader( shader );
+
+   GLint success;
+   glGetShaderiv( shader, GL_COMPILE_STATUS, &success );
+   if( !success )
+   {
+      char log[1024];
+      glGetShaderInfoLog( shader, 1024, nullptr, log );
+      std::cout << "Shader compile error:\n" << log << std::endl;
+   }
+   return shader;
+}
+
+static GLuint linkProgram( GLuint* shaders, int count )
+{
+   GLuint prog = glCreateProgram();
+   for( int i = 0; i < count; ++i )
+      glAttachShader( prog, shaders[i] );
+   glLinkProgram( prog );
+
+   GLint success;
+   glGetProgramiv( prog, GL_LINK_STATUS, &success );
+   if( !success )
+   {
+      char log[1024];
+      glGetProgramInfoLog( prog, 1024, nullptr, log );
+      std::cout << "Program link error:\n" << log << std::endl;
+   }
+
+   for( int i = 0; i < count; ++i )
+      glDeleteShader( shaders[i] );
+   return prog;
+}
+
+static float randFloat( float lo, float hi )
+{
+   return lo + static_cast<float>( std::rand() ) / ( static_cast<float>( RAND_MAX / ( hi - lo ) ) );
+}
+
+static Vector randVecInSphere( float radius )
+{
+   Vector v;
+   do {
+      v = Vector( randFloat( -1, 1 ), randFloat( -1, 1 ), randFloat( -1, 1 ) );
+   } while( v.x * v.x + v.y * v.y + v.z * v.z > 1.0f );
+   return Vector( v.x * radius, v.y * radius, v.z * radius );
+}
+
+// GPU-side boid data (matches GLSL struct layout)
+struct BoidGPU {
+   float px, py, pz, type; // pos.xyz, pos.w
+   float vx, vy, vz, pad;  // vel.xyz, vel.w
+};
+
+// ============================================================
+// GLViewBoidSwarm
+// ============================================================
 
 GLViewBoidSwarm* GLViewBoidSwarm::New( const std::vector< std::string >& args )
 {
@@ -37,11 +339,9 @@ GLViewBoidSwarm* GLViewBoidSwarm::New( const std::vector< std::string >& args )
    return glv;
 }
 
-
 GLViewBoidSwarm::GLViewBoidSwarm( const std::vector< std::string >& args ) : GLView( args )
 {
 }
-
 
 void GLViewBoidSwarm::onCreate()
 {
@@ -51,52 +351,237 @@ void GLViewBoidSwarm::onCreate()
       this->pe->setGravityScalar( Aftr::GRAVITY );
    }
    this->setActorChaseType( STANDARDEZNAV );
-}
 
+   // GL context is ready — initialize compute + render shaders
+   initComputeShader();
+   initRenderShader();
+   initBoidBuffers();
+   resetSimulation();
+
+   std::cout << "BoidSwarm compute shader initialized with " << boid_gui.numBoids << " boids." << std::endl;
+}
 
 GLViewBoidSwarm::~GLViewBoidSwarm()
 {
+   if( computeProgram ) glDeleteProgram( computeProgram );
+   if( renderProgram )  glDeleteProgram( renderProgram );
+   if( ssbo[0] ) glDeleteBuffers( 2, ssbo );
+   if( boidVAO ) glDeleteVertexArrays( 1, &boidVAO );
+   if( boidVBO ) glDeleteBuffers( 1, &boidVBO );
+   if( boidEBO ) glDeleteBuffers( 1, &boidEBO );
 }
 
+// ============================================================
+// Shader & Buffer Initialization
+// ============================================================
+
+void GLViewBoidSwarm::initComputeShader()
+{
+   GLuint cs = compileShader( GL_COMPUTE_SHADER, computeShaderSource );
+   computeProgram = linkProgram( &cs, 1 );
+}
+
+void GLViewBoidSwarm::initRenderShader()
+{
+   GLuint shaders[2];
+   shaders[0] = compileShader( GL_VERTEX_SHADER, boidVertexShaderSource );
+   shaders[1] = compileShader( GL_FRAGMENT_SHADER, boidFragmentShaderSource );
+   renderProgram = linkProgram( shaders, 2 );
+}
+
+void GLViewBoidSwarm::initBoidBuffers()
+{
+   // Create double-buffered SSBOs (sized later in resetSimulation)
+   glGenBuffers( 2, ssbo );
+
+   // Tetrahedron mesh: nose at +X, wider tail at -X
+   float verts[] = {
+       1.0f,  0.0f,  0.0f,   // v0: nose
+      -0.5f,  0.4f,  0.2f,   // v1: top-left tail
+      -0.5f, -0.4f,  0.2f,   // v2: top-right tail
+      -0.5f,  0.0f, -0.3f    // v3: bottom tail
+   };
+   unsigned int indices[] = {
+      0, 1, 2,  // top face
+      0, 3, 1,  // left face
+      0, 2, 3,  // right face
+      1, 3, 2   // back face
+   };
+
+   glGenVertexArrays( 1, &boidVAO );
+   glGenBuffers( 1, &boidVBO );
+   glGenBuffers( 1, &boidEBO );
+
+   glBindVertexArray( boidVAO );
+
+   glBindBuffer( GL_ARRAY_BUFFER, boidVBO );
+   glBufferData( GL_ARRAY_BUFFER, sizeof( verts ), verts, GL_STATIC_DRAW );
+
+   glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, boidEBO );
+   glBufferData( GL_ELEMENT_ARRAY_BUFFER, sizeof( indices ), indices, GL_STATIC_DRAW );
+
+   glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof( float ), (void*)0 );
+   glEnableVertexAttribArray( 0 );
+
+   glBindVertexArray( 0 );
+}
+
+void GLViewBoidSwarm::resetSimulation()
+{
+   int n = boid_gui.numBoids;
+   int total = n + 1; // +1 for predator
+
+   std::vector<BoidGPU> data( total );
+   for( int i = 0; i < n; ++i )
+   {
+      Vector p = randVecInSphere( 15.0f );
+      Vector v = randVecInSphere( 0.1f );
+      data[i] = { p.x, p.y, p.z, 0.0f, v.x, v.y, v.z, 0.0f };
+   }
+   // Predator (last element)
+   Vector pp = randVecInSphere( 20.0f );
+   Vector pv = randVecInSphere( 0.05f );
+   data[n] = { pp.x, pp.y, pp.z, 1.0f, pv.x, pv.y, pv.z, 0.0f };
+
+   GLsizeiptr bufSize = total * sizeof( BoidGPU );
+
+   glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[0] );
+   glBufferData( GL_SHADER_STORAGE_BUFFER, bufSize, data.data(), GL_DYNAMIC_DRAW );
+
+   glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[1] );
+   glBufferData( GL_SHADER_STORAGE_BUFFER, bufSize, nullptr, GL_DYNAMIC_DRAW );
+
+   glBindBuffer( GL_SHADER_STORAGE_BUFFER, 0 );
+   readIdx = 0;
+}
+
+// ============================================================
+// Per-Frame Update
+// ============================================================
 
 void GLViewBoidSwarm::updateWorld()
 {
    GLView::updateWorld();
 
-   if( this->boid_gui.resetRequested )
+   if( boid_gui.resetRequested )
    {
-      this->boid_gui.resetRequested = false;
-      this->spawnBoids();
+      boid_gui.resetRequested = false;
+      resetSimulation();
    }
 
-   if( !this->boid_gui.isPaused )
-      this->updateBoids();
+   if( boid_gui.isPaused )
+      return;
+
+   int n = boid_gui.numBoids;
+   int writeIdx = 1 - readIdx;
+
+   glUseProgram( computeProgram );
+
+   // Set uniforms
+   glUniform1i( glGetUniformLocation( computeProgram, "u_numBoids" ),  n );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_sepWeight" ), boid_gui.separationWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_aliWeight" ), boid_gui.alignmentWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_cohWeight" ), boid_gui.cohesionWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_bndWeight" ), boid_gui.boundaryWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_fleWeight" ), boid_gui.fleeWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_obsWeight" ), boid_gui.obstacleWeight );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_sepRadius" ), boid_gui.separationRadius );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_neiRadius" ), boid_gui.neighborRadius );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_feaRadius" ), boid_gui.fearRadius );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_bndRadius" ), boid_gui.boundaryRadius );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_maxSpeed" ),  boid_gui.maxSpeed );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_predSpeed" ), boid_gui.predatorSpeed );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_dt" ),        0.05f );
+
+   // Obstacle uniforms
+   glUniform1i( glGetUniformLocation( computeProgram, "u_numObstacles" ), NUM_OBSTACLES );
+   for( int i = 0; i < NUM_OBSTACLES; ++i )
+   {
+      std::string name = "u_obstacles[" + std::to_string( i ) + "]";
+      glUniform4f( glGetUniformLocation( computeProgram, name.c_str() ),
+                   obstaclePositions[i].x, obstaclePositions[i].y,
+                   obstaclePositions[i].z, obstacleAvoidRadius );
+   }
+
+   // Bind SSBOs: read from readIdx, write to writeIdx
+   glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 0, ssbo[readIdx] );
+   glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 1, ssbo[writeIdx] );
+
+   // Dispatch one thread per entity
+   glDispatchCompute( ( n + 1 + 255 ) / 256, 1, 1 );
+
+   // Barrier: ensure compute writes are visible to vertex shader reads
+   glMemoryBarrier( GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT );
+
+   // Swap buffers
+   readIdx = writeIdx;
+
+   glUseProgram( 0 );
 }
 
+// ============================================================
+// Rendering (called from ImGui callback, like ChaosGame)
+// ============================================================
+
+void GLViewBoidSwarm::renderBoids()
+{
+   if( !renderProgram ) return;
+
+   int n = boid_gui.numBoids;
+
+   Mat4 view = this->cam->getCameraViewMatrix();
+   Mat4 proj = this->cam->getCameraProjectionMatrix();
+
+   glUseProgram( renderProgram );
+
+   glUniformMatrix4fv( glGetUniformLocation( renderProgram, "u_view" ), 1, GL_FALSE, view.getPtr() );
+   glUniformMatrix4fv( glGetUniformLocation( renderProgram, "u_proj" ), 1, GL_FALSE, proj.getPtr() );
+
+   // Bind the latest SSBO for the vertex shader to read positions/velocities
+   glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 0, ssbo[readIdx] );
+
+   glEnable( GL_DEPTH_TEST );
+   glBindVertexArray( boidVAO );
+
+   // Draw boids: teal, small
+   glUniform4f( glGetUniformLocation( renderProgram, "u_color" ), 0.0f, 0.7f, 0.85f, 1.0f );
+   glUniform1f( glGetUniformLocation( renderProgram, "u_scale" ), 0.5f );
+   glUniform1i( glGetUniformLocation( renderProgram, "u_instanceOffset" ), 0 );
+   glDrawElementsInstanced( GL_TRIANGLES, 12, GL_UNSIGNED_INT, 0, n );
+
+   // Draw predator: red, large
+   glUniform4f( glGetUniformLocation( renderProgram, "u_color" ), 0.85f, 0.15f, 0.15f, 1.0f );
+   glUniform1f( glGetUniformLocation( renderProgram, "u_scale" ), 1.5f );
+   glUniform1i( glGetUniformLocation( renderProgram, "u_instanceOffset" ), n );
+   glDrawElementsInstanced( GL_TRIANGLES, 12, GL_UNSIGNED_INT, 0, 1 );
+
+   glBindVertexArray( 0 );
+   glUseProgram( 0 );
+}
+
+// ============================================================
+// Event Handlers
+// ============================================================
 
 void GLViewBoidSwarm::onResizeWindow( GLsizei width, GLsizei height )
 {
    GLView::onResizeWindow( width, height );
 }
 
-
 void GLViewBoidSwarm::onMouseDown( const SDL_MouseButtonEvent& e )
 {
    GLView::onMouseDown( e );
 }
-
 
 void GLViewBoidSwarm::onMouseUp( const SDL_MouseButtonEvent& e )
 {
    GLView::onMouseUp( e );
 }
 
-
 void GLViewBoidSwarm::onMouseMove( const SDL_MouseMotionEvent& e )
 {
    GLView::onMouseMove( e );
 }
-
 
 void GLViewBoidSwarm::onKeyDown( const SDL_KeyboardEvent& key )
 {
@@ -105,334 +590,14 @@ void GLViewBoidSwarm::onKeyDown( const SDL_KeyboardEvent& key )
       this->setNumPhysicsStepsPerRender( 1 );
 }
 
-
 void GLViewBoidSwarm::onKeyUp( const SDL_KeyboardEvent& key )
 {
    GLView::onKeyUp( key );
 }
 
-
-WO* GLViewBoidSwarm::createBoidWO( float scale, aftrColor4ub color )
-{
-   // Tetrahedron: nose at +X, wider tail at -X
-   std::vector< Vector > verts;
-   verts.push_back( Vector( 1.0f * scale, 0.0f, 0.0f ) );            // 0: nose
-   verts.push_back( Vector( -0.5f * scale, 0.4f * scale, 0.2f * scale ) );  // 1: top-left tail
-   verts.push_back( Vector( -0.5f * scale, -0.4f * scale, 0.2f * scale ) ); // 2: top-right tail
-   verts.push_back( Vector( -0.5f * scale, 0.0f, -0.3f * scale ) );         // 3: bottom tail
-
-   std::vector< unsigned int > indices;
-   // Top face
-   indices.push_back( 0 ); indices.push_back( 1 ); indices.push_back( 2 );
-   // Left face
-   indices.push_back( 0 ); indices.push_back( 3 ); indices.push_back( 1 );
-   // Right face
-   indices.push_back( 0 ); indices.push_back( 2 ); indices.push_back( 3 );
-   // Back face
-   indices.push_back( 1 ); indices.push_back( 3 ); indices.push_back( 2 );
-
-   // Per-vertex colors: nose bright, tail slightly darker
-   aftrColor4ub noseColor = color;
-   aftrColor4ub tailColor( (uint8_t)(color.r * 0.6f), (uint8_t)(color.g * 0.6f),
-                           (uint8_t)(color.b * 0.6f), color.a );
-   std::vector< aftrColor4ub > colors;
-   colors.push_back( noseColor ); // nose
-   colors.push_back( tailColor ); // tail verts
-   colors.push_back( tailColor );
-   colors.push_back( tailColor );
-
-   WO* wo = WO::New();
-   MGLIndexedGeometry* mgl = MGLIndexedGeometry::New( wo );
-   IndexedGeometryTriangles* geo = IndexedGeometryTriangles::New( verts, indices, colors );
-   mgl->setIndexedGeometry( geo );
-   wo->setModel( mgl );
-   wo->renderOrderType = RENDER_ORDER_TYPE::roOPAQUE;
-   return wo;
-}
-
-
-static float randFloat( float lo, float hi )
-{
-   return lo + static_cast<float>( std::rand() ) / ( static_cast<float>( RAND_MAX / ( hi - lo ) ) );
-}
-
-static Vector randVecInSphere( float radius )
-{
-   // Rejection sampling for uniform distribution in a sphere
-   Vector v;
-   do {
-      v = Vector( randFloat( -1, 1 ), randFloat( -1, 1 ), randFloat( -1, 1 ) );
-   } while( v.x * v.x + v.y * v.y + v.z * v.z > 1.0f );
-   return Vector( v.x * radius, v.y * radius, v.z * radius );
-}
-
-
-void GLViewBoidSwarm::spawnBoids()
-{
-   // Remove existing boid WOs from worldLst
-   for( auto& b : this->boids )
-      if( b.wo != nullptr )
-         this->worldLst->eraseViaWOptr( b.wo );
-   if( this->predator.wo != nullptr )
-      this->worldLst->eraseViaWOptr( this->predator.wo );
-
-   this->boids.clear();
-
-   // Spawn boids
-   for( int i = 0; i < INITIAL_BOID_COUNT; ++i )
-   {
-      Boid b;
-      b.wo = this->createBoidWO( 0.5f, aftrColor4ub( 0, 180, 220, 255 ) ); // teal
-      b.wo->setLabel( "Boid" );
-
-      Vector pos = randVecInSphere( 15.0f );
-      b.wo->setPosition( pos );
-
-      b.vel = randVecInSphere( 0.1f );
-      b.acc = Vector( 0, 0, 0 );
-
-      this->worldLst->push_back( b.wo );
-      this->boids.push_back( b );
-   }
-
-   // Spawn predator
-   this->predator.wo = this->createBoidWO( 1.5f, aftrColor4ub( 220, 40, 40, 255 ) ); // red
-   this->predator.wo->setLabel( "Predator" );
-   this->predator.wo->setPosition( randVecInSphere( 20.0f ) );
-   this->predator.vel = randVecInSphere( 0.05f );
-   this->predator.acc = Vector( 0, 0, 0 );
-   this->worldLst->push_back( this->predator.wo );
-}
-
-
-void GLViewBoidSwarm::orientToVelocity( WO* wo, const Vector& pos, const Vector& vel )
-{
-   float speed = std::sqrt( vel.x * vel.x + vel.y * vel.y + vel.z * vel.z );
-   if( speed < 0.0001f ) return;
-
-   Vector fwd( vel.x / speed, vel.y / speed, vel.z / speed );
-
-   // Choose an up hint that isn't parallel to fwd
-   Vector upHint( 0, 0, 1 );
-   float dot = fwd.x * upHint.x + fwd.y * upHint.y + fwd.z * upHint.z;
-   if( std::fabs( dot ) > 0.99f )
-      upHint = Vector( 0, 1, 0 );
-
-   // right = fwd x upHint
-   Vector right;
-   right.x = fwd.y * upHint.z - fwd.z * upHint.y;
-   right.y = fwd.z * upHint.x - fwd.x * upHint.z;
-   right.z = fwd.x * upHint.y - fwd.y * upHint.x;
-   float rLen = std::sqrt( right.x * right.x + right.y * right.y + right.z * right.z );
-   right.x /= rLen; right.y /= rLen; right.z /= rLen;
-
-   // up = right x fwd
-   Vector up;
-   up.x = right.y * fwd.z - right.z * fwd.y;
-   up.y = right.z * fwd.x - right.x * fwd.z;
-   up.z = right.x * fwd.y - right.y * fwd.x;
-
-   // Mat4 is column-major: columns are X(fwd), Y(right), Z(up)
-   Mat4 pose( fwd, right, up );
-   pose.setPosition( pos );
-   wo->setPose( pose );
-}
-
-
-void GLViewBoidSwarm::updateBoids()
-{
-   const float sepW = this->boid_gui.separationWeight;
-   const float aliW = this->boid_gui.alignmentWeight;
-   const float cohW = this->boid_gui.cohesionWeight;
-   const float bndW = this->boid_gui.boundaryWeight;
-   const float fleW = this->boid_gui.fleeWeight;
-   const float sepR = this->boid_gui.separationRadius;
-   const float neiR = this->boid_gui.neighborRadius;
-   const float feaR = this->boid_gui.fearRadius;
-   const float bndR = this->boid_gui.boundaryRadius;
-   const float mSpd = this->boid_gui.maxSpeed;
-   const float pSpd = this->boid_gui.predatorSpeed;
-
-   const size_t n = this->boids.size();
-   Vector predPos = this->predator.wo->getPosition();
-
-   // --- Update each boid ---
-   for( size_t i = 0; i < n; ++i )
-   {
-      Boid& bi = this->boids[i];
-      Vector pos = bi.wo->getPosition();
-      bi.acc = Vector( 0, 0, 0 );
-
-      Vector separation( 0, 0, 0 );
-      Vector alignSum( 0, 0, 0 );
-      Vector cohesionSum( 0, 0, 0 );
-      int sepCount = 0;
-      int neiCount = 0;
-
-      for( size_t j = 0; j < n; ++j )
-      {
-         if( i == j ) continue;
-         Vector other = this->boids[j].wo->getPosition();
-         float dx = pos.x - other.x;
-         float dy = pos.y - other.y;
-         float dz = pos.z - other.z;
-         float dist = std::sqrt( dx * dx + dy * dy + dz * dz );
-
-         // Separation
-         if( dist < sepR && dist > 0.001f )
-         {
-            float strength = ( sepR - dist ) / sepR; // stronger when closer
-            separation.x += ( dx / dist ) * strength;
-            separation.y += ( dy / dist ) * strength;
-            separation.z += ( dz / dist ) * strength;
-            sepCount++;
-         }
-
-         // Alignment + Cohesion (same neighbor radius)
-         if( dist < neiR )
-         {
-            alignSum.x += this->boids[j].vel.x;
-            alignSum.y += this->boids[j].vel.y;
-            alignSum.z += this->boids[j].vel.z;
-
-            cohesionSum.x += other.x;
-            cohesionSum.y += other.y;
-            cohesionSum.z += other.z;
-            neiCount++;
-         }
-      }
-
-      // Apply separation
-      if( sepCount > 0 )
-      {
-         bi.acc.x += separation.x * sepW;
-         bi.acc.y += separation.y * sepW;
-         bi.acc.z += separation.z * sepW;
-      }
-
-      // Apply alignment: steer toward average velocity
-      if( neiCount > 0 )
-      {
-         float avgVx = alignSum.x / neiCount;
-         float avgVy = alignSum.y / neiCount;
-         float avgVz = alignSum.z / neiCount;
-         bi.acc.x += ( avgVx - bi.vel.x ) * aliW;
-         bi.acc.y += ( avgVy - bi.vel.y ) * aliW;
-         bi.acc.z += ( avgVz - bi.vel.z ) * aliW;
-      }
-
-      // Apply cohesion: steer toward center of neighbors
-      if( neiCount > 0 )
-      {
-         float cx = cohesionSum.x / neiCount;
-         float cy = cohesionSum.y / neiCount;
-         float cz = cohesionSum.z / neiCount;
-         bi.acc.x += ( cx - pos.x ) * cohW;
-         bi.acc.y += ( cy - pos.y ) * cohW;
-         bi.acc.z += ( cz - pos.z ) * cohW;
-      }
-
-      // Boundary containment
-      float distFromOrigin = std::sqrt( pos.x * pos.x + pos.y * pos.y + pos.z * pos.z );
-      if( distFromOrigin > bndR )
-      {
-         float overshoot = distFromOrigin - bndR;
-         bi.acc.x += ( -pos.x / distFromOrigin ) * overshoot * bndW;
-         bi.acc.y += ( -pos.y / distFromOrigin ) * overshoot * bndW;
-         bi.acc.z += ( -pos.z / distFromOrigin ) * overshoot * bndW;
-      }
-
-      // Predator avoidance
-      float pdx = pos.x - predPos.x;
-      float pdy = pos.y - predPos.y;
-      float pdz = pos.z - predPos.z;
-      float predDist = std::sqrt( pdx * pdx + pdy * pdy + pdz * pdz );
-      if( predDist < feaR && predDist > 0.001f )
-      {
-         float strength = ( feaR - predDist ) / predDist; // inverse: panic when close
-         bi.acc.x += ( pdx / predDist ) * strength * fleW;
-         bi.acc.y += ( pdy / predDist ) * strength * fleW;
-         bi.acc.z += ( pdz / predDist ) * strength * fleW;
-      }
-
-      // Integrate velocity
-      bi.vel.x += bi.acc.x * 0.05f; // scale down acceleration for smooth motion
-      bi.vel.y += bi.acc.y * 0.05f;
-      bi.vel.z += bi.acc.z * 0.05f;
-
-      // Clamp speed
-      float speed = std::sqrt( bi.vel.x * bi.vel.x + bi.vel.y * bi.vel.y + bi.vel.z * bi.vel.z );
-      if( speed > mSpd )
-      {
-         bi.vel.x = ( bi.vel.x / speed ) * mSpd;
-         bi.vel.y = ( bi.vel.y / speed ) * mSpd;
-         bi.vel.z = ( bi.vel.z / speed ) * mSpd;
-      }
-
-      // Update position
-      Vector newPos( pos.x + bi.vel.x, pos.y + bi.vel.y, pos.z + bi.vel.z );
-      this->orientToVelocity( bi.wo, newPos, bi.vel );
-   }
-
-   // --- Update predator: chase flock centroid ---
-   this->predator.acc = Vector( 0, 0, 0 );
-   if( n > 0 )
-   {
-      Vector centroid( 0, 0, 0 );
-      for( size_t i = 0; i < n; ++i )
-      {
-         Vector p = this->boids[i].wo->getPosition();
-         centroid.x += p.x;
-         centroid.y += p.y;
-         centroid.z += p.z;
-      }
-      centroid.x /= (float)n;
-      centroid.y /= (float)n;
-      centroid.z /= (float)n;
-
-      float dx = centroid.x - predPos.x;
-      float dy = centroid.y - predPos.y;
-      float dz = centroid.z - predPos.z;
-      float dist = std::sqrt( dx * dx + dy * dy + dz * dz );
-      if( dist > 0.01f )
-      {
-         this->predator.acc.x = ( dx / dist ) * 0.5f;
-         this->predator.acc.y = ( dy / dist ) * 0.5f;
-         this->predator.acc.z = ( dz / dist ) * 0.5f;
-      }
-   }
-
-   // Predator boundary containment
-   float predDistOrigin = std::sqrt( predPos.x * predPos.x + predPos.y * predPos.y + predPos.z * predPos.z );
-   if( predDistOrigin > bndR )
-   {
-      float overshoot = predDistOrigin - bndR;
-      this->predator.acc.x += ( -predPos.x / predDistOrigin ) * overshoot * bndW;
-      this->predator.acc.y += ( -predPos.y / predDistOrigin ) * overshoot * bndW;
-      this->predator.acc.z += ( -predPos.z / predDistOrigin ) * overshoot * bndW;
-   }
-
-   // Integrate predator
-   this->predator.vel.x += this->predator.acc.x * 0.05f;
-   this->predator.vel.y += this->predator.acc.y * 0.05f;
-   this->predator.vel.z += this->predator.acc.z * 0.05f;
-
-   float pSpeed = std::sqrt( this->predator.vel.x * this->predator.vel.x +
-                             this->predator.vel.y * this->predator.vel.y +
-                             this->predator.vel.z * this->predator.vel.z );
-   if( pSpeed > pSpd )
-   {
-      this->predator.vel.x = ( this->predator.vel.x / pSpeed ) * pSpd;
-      this->predator.vel.y = ( this->predator.vel.y / pSpeed ) * pSpd;
-      this->predator.vel.z = ( this->predator.vel.z / pSpeed ) * pSpd;
-   }
-
-   Vector newPredPos( predPos.x + this->predator.vel.x,
-                      predPos.y + this->predator.vel.y,
-                      predPos.z + this->predator.vel.z );
-   this->orientToVelocity( this->predator.wo, newPredPos, this->predator.vel );
-}
-
+// ============================================================
+// Scene Setup
+// ============================================================
 
 void Aftr::GLViewBoidSwarm::loadMap()
 {
@@ -446,11 +611,12 @@ void Aftr::GLViewBoidSwarm::loadMap()
    Axes::isVisible = false;
    this->glRenderer->isUsingShadowMapping( false );
 
-   // Camera pulled back to see the swarm
    this->cam->setPosition( 0, 0, 60 );
 
+   std::srand( static_cast<unsigned int>( std::time( nullptr ) ) );
+
+   // ---- Light ----
    {
-      // Light
       float ga = 0.2f;
       ManagerLight::setGlobalAmbientLight( aftrColor4f( ga, ga, ga, 1.0f ) );
       WOLight* light = WOLight::New();
@@ -461,8 +627,8 @@ void Aftr::GLViewBoidSwarm::loadMap()
       worldLst->push_back( light );
    }
 
+   // ---- SkyBox (water theme) ----
    {
-      // SkyBox — water theme
       std::string skyBox = ManagerEnvironmentConfiguration::getSMM() + "/images/skyboxes/sky_water+6.jpg";
       WO* wo = WOSkyBox::New( skyBox, this->getCameraPtrPtr() );
       wo->setPosition( Vector( 0, 0, 0 ) );
@@ -471,17 +637,58 @@ void Aftr::GLViewBoidSwarm::loadMap()
       worldLst->push_back( wo );
    }
 
-   // Spawn the boid swarm and predator
-   std::srand( static_cast<unsigned int>( std::time( nullptr ) ) );
-   this->spawnBoids();
+   // ---- Obstacle boxes ----
+   {
+      std::string cubeModel = ManagerEnvironmentConfiguration::getSMM() + "/models/cube4x4x4redShinyPlastic_pp.wrl";
+      for( int i = 0; i < NUM_OBSTACLES; ++i )
+      {
+         WO* obs = WO::New( cubeModel, Vector( 1.5f, 1.5f, 1.5f ), MESH_SHADING_TYPE::mstFLAT );
+         obs->setPosition( obstaclePositions[i] );
+         obs->renderOrderType = RENDER_ORDER_TYPE::roOPAQUE;
+         obs->upon_async_model_loaded( [obs]()
+            {
+               ModelMeshSkin& skin = obs->getModel()->getModelDataShared()->getModelMeshes().at( 0 )->getSkins().at( 0 );
+               skin.setAmbient( aftrColor4f( 0.15f, 0.35f, 0.15f, 1.0f ) );
+               skin.setDiffuse( aftrColor4f( 0.2f, 0.5f, 0.25f, 1.0f ) );
+               skin.setSpecular( aftrColor4f( 0.1f, 0.2f, 0.1f, 1.0f ) );
+               skin.setSpecularCoefficient( 5 );
+            } );
+         obs->setLabel( "Obstacle" );
+         worldLst->push_back( obs );
+         obstacleWOs[i] = obs;
+      }
+   }
 
-   // ImGui
+   // ---- Translucent aquarium sphere ----
+   {
+      this->aquarium = WO::New();
+      MGLIndexedGeometry* mglSphere = MGLIndexedGeometry::New( this->aquarium );
+      IndexedGeometrySphereTriStrip* geoSphere = IndexedGeometrySphereTriStrip::New(
+         boid_gui.boundaryRadius, 32, 32, true, true );
+      mglSphere->setIndexedGeometry( geoSphere );
+      this->aquarium->setModel( mglSphere );
+      this->aquarium->setPosition( Vector( 0, 0, 0 ) );
+      this->aquarium->renderOrderType = RENDER_ORDER_TYPE::roTRANSPARENT;
+      this->aquarium->setLabel( "Aquarium" );
+
+      // Semi-transparent blue tint
+      this->aquarium->getModel()->getSkin().setAmbient( aftrColor4f( 0.2f, 0.4f, 0.7f, 0.12f ) );
+      this->aquarium->getModel()->getSkin().setDiffuse( aftrColor4f( 0.3f, 0.5f, 0.8f, 0.12f ) );
+
+      this->worldLst->push_back( this->aquarium );
+   }
+
+   // ---- ImGui ----
    {
       this->gui = WOImGui::New( nullptr );
       gui->setLabel( "My Gui" );
 
-      auto woEditFunc = [this]() { this->wo_editor.draw( this->getLastSelectionQuery(), *this->getWorldContainer(), this->getCamera_functor() ); };
-      auto showDemoWindow_ImGui = [this]() { ImGui::ShowDemoWindow(); };
+      auto woEditFunc = [this]() {
+         this->wo_editor.draw( this->getLastSelectionQuery(),
+                               *this->getWorldContainer(),
+                               this->getCamera_functor() );
+      };
+      auto showDemoWindow_ImGui    = [this]() { ImGui::ShowDemoWindow(); };
       auto showDemoWindow_AftrDemo = [this]() { WOImGui::draw_AftrImGui_Demo( this->gui ); };
       auto showDemoWindow_ImGuiPlot = [this]() { ImPlot::ShowDemoWindow(); };
       auto show_boid_controls = [this]() { this->boid_gui.draw(); };
@@ -489,6 +696,9 @@ void Aftr::GLViewBoidSwarm::loadMap()
       this->gui->subscribe_drawImGuiWidget(
          [=,this]()
          {
+            // Render boids inside the ImGui callback (same pattern as ChaosGame)
+            this->renderBoids();
+
             menu.attach( "Edit", "Show WO Editor", woEditFunc );
             menu.attach( "Demos", "Show Default ImGui Demo", showDemoWindow_ImGui );
             menu.attach( "Demos", "Show Default ImPlot Demo", showDemoWindow_ImGuiPlot );

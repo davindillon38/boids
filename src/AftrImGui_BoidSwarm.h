@@ -18,6 +18,7 @@ public:
    float cohesionWeight = 1.0f;
    float boundaryWeight = 2.0f;
    float fleeWeight = 3.0f;
+   float obstacleWeight = 3.0f;
 
    // Radii
    float separationRadius = 2.0f;
@@ -28,6 +29,9 @@ public:
    // Speeds
    float maxSpeed = 0.3f;
    float predatorSpeed = 0.15f;
+
+   // Boid count
+   int numBoids = 1000;
 
    // Simulation control
    bool isPaused = false;

@@ -52,6 +52,7 @@ layout(std430, binding = 0) readonly  buffer BoidInput  { BoidData boidsIn[];  }
 layout(std430, binding = 1)           buffer BoidOutput { BoidData boidsOut[]; };
 
 uniform int   u_numBoids;
+uniform int   u_numPredators;
 uniform float u_sepWeight;
 uniform float u_aliWeight;
 uniform float u_cohWeight;
@@ -89,12 +90,12 @@ vec3 hash3( uint seed ) {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint totalEntities = uint(u_numBoids) + 1u;
+    uint totalEntities = uint(u_numBoids) + uint(u_numPredators);
     if (idx >= totalEntities) return;
 
     vec3 myPos = boidsIn[idx].pos.xyz;
     vec3 myVel = boidsIn[idx].vel.xyz;
-    bool isPredator = (idx == uint(u_numBoids));
+    bool isPredator = (idx >= uint(u_numBoids));
 
     vec3 acc = vec3(0.0);
     float velW = 0.0; // used by predator to persist locked target index
@@ -160,13 +161,18 @@ void main() {
             acc += (-myPos / distOrigin) * t * t * u_bndWeight; // quadratic falloff
         }
 
-        // Predator avoidance
-        vec3 predPos  = boidsIn[u_numBoids].pos.xyz;
-        vec3 predDiff = myPos - predPos;
-        float predDist = length(predDiff);
-        if (predDist < u_feaRadius && predDist > 0.001) {
-            float strength = (u_feaRadius - predDist) / predDist;
-            acc += normalize(predDiff) * strength * u_fleWeight;
+        // Predator avoidance (flee from ALL predators)
+        float nearestPredDist = 1e20;
+        for (int p = 0; p < u_numPredators; ++p) {
+            vec3 predPos  = boidsIn[uint(u_numBoids) + uint(p)].pos.xyz;
+            vec3 predDiff = myPos - predPos;
+            float predDist = length(predDiff);
+            if (predDist < nearestPredDist)
+                nearestPredDist = predDist;
+            if (predDist < u_feaRadius && predDist > 0.001) {
+                float strength = (u_feaRadius - predDist) / predDist;
+                acc += normalize(predDiff) * strength * u_fleWeight;
+            }
         }
 
         // Obstacle avoidance
@@ -194,7 +200,7 @@ void main() {
             myVel = normalize(myVel) * u_maxSpeed * 0.1; // minimum speed so boids keep swimming
 
         // Eaten by predator — respawn at random location
-        if (predDist < u_eatRadius) {
+        if (nearestPredDist < u_eatRadius) {
             vec3 rng = hash3( idx * 7919u + uint(u_frame) * 6271u + 12345u );
             myPos = normalize(rng) * u_bndRadius * 0.6;
             myVel = hash3( idx * 3571u + uint(u_frame) * 1777u + 54321u ) * u_maxSpeed * 0.5;
@@ -542,7 +548,8 @@ void GLViewBoidSwarm::initBoidBuffers()
 void GLViewBoidSwarm::resetSimulation()
 {
    int n = boid_gui.numBoids;
-   int total = n + 1; // +1 for predator
+   int np = boid_gui.numPredators;
+   int total = n + np;
 
    std::vector<BoidGPU> data( total );
    for( int i = 0; i < n; ++i )
@@ -554,10 +561,13 @@ void GLViewBoidSwarm::resetSimulation()
          v = Vector( 0.1f, 0.1f, 0.0f );
       data[i] = { p.x, p.y, p.z, 0.0f, v.x, v.y, v.z, 0.0f };
    }
-   // Predator (last element)
-   Vector pp = randVecInSphere( 20.0f );
-   Vector pv = randVecInSphere( 0.05f );
-   data[n] = { pp.x, pp.y, pp.z, 1.0f, pv.x, pv.y, pv.z, 0.0f };
+   // Predators (elements n .. n+np-1)
+   for( int i = 0; i < np; ++i )
+   {
+      Vector pp = randVecInSphere( 20.0f );
+      Vector pv = randVecInSphere( 0.05f );
+      data[n + i] = { pp.x, pp.y, pp.z, 1.0f, pv.x, pv.y, pv.z, 0.0f };
+   }
 
    GLsizeiptr bufSize = total * sizeof( BoidGPU );
 
@@ -601,7 +611,9 @@ void GLViewBoidSwarm::updateWorld()
    glUseProgram( computeProgram );
 
    // Set uniforms
+   int np = boid_gui.numPredators;
    glUniform1i( glGetUniformLocation( computeProgram, "u_numBoids" ),  n );
+   glUniform1i( glGetUniformLocation( computeProgram, "u_numPredators" ), np );
    glUniform1f( glGetUniformLocation( computeProgram, "u_sepWeight" ), boid_gui.separationWeight );
    glUniform1f( glGetUniformLocation( computeProgram, "u_aliWeight" ), boid_gui.alignmentWeight );
    glUniform1f( glGetUniformLocation( computeProgram, "u_cohWeight" ), boid_gui.cohesionWeight );
@@ -622,8 +634,9 @@ void GLViewBoidSwarm::updateWorld()
    static int frameCounter = 0;
    glUniform1i( glGetUniformLocation( computeProgram, "u_frame" ), frameCounter++ );
 
-   // Obstacle uniforms
-   glUniform1i( glGetUniformLocation( computeProgram, "u_numObstacles" ), NUM_OBSTACLES );
+   // Obstacle uniforms (pass 0 when disabled)
+   int activeObstacles = boid_gui.showObstacles ? NUM_OBSTACLES : 0;
+   glUniform1i( glGetUniformLocation( computeProgram, "u_numObstacles" ), activeObstacles );
    for( int i = 0; i < NUM_OBSTACLES; ++i )
    {
       std::string name = "u_obstacles[" + std::to_string( i ) + "]";
@@ -632,12 +645,17 @@ void GLViewBoidSwarm::updateWorld()
                    obstaclePositions[i].z, obstacleAvoidRadius );
    }
 
+   // Show/hide pillar WOs
+   for( int i = 0; i < NUM_OBSTACLES; ++i )
+      if( obstacleWOs[i] )
+         obstacleWOs[i]->isVisible = boid_gui.showObstacles;
+
    // Bind SSBOs: read from readIdx, write to writeIdx
    glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 0, ssbo[readIdx] );
    glBindBufferBase( GL_SHADER_STORAGE_BUFFER, 1, ssbo[writeIdx] );
 
    // Dispatch one thread per entity
-   glDispatchCompute( ( n + 1 + 255 ) / 256, 1, 1 );
+   glDispatchCompute( ( n + np + 255 ) / 256, 1, 1 );
 
    // Barrier: ensure compute writes are visible to subsequent reads
    glMemoryBarrier( GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT );
@@ -683,11 +701,15 @@ void GLViewBoidSwarm::renderBoids()
    glUniform1i( glGetUniformLocation( renderProgram, "u_instanceOffset" ), 0 );
    glDrawElementsInstanced( GL_TRIANGLES, 12, GL_UNSIGNED_INT, 0, n );
 
-   // Draw predator: red, large
-   glUniform4f( glGetUniformLocation( renderProgram, "u_color" ), 0.85f, 0.15f, 0.15f, 1.0f );
-   glUniform1f( glGetUniformLocation( renderProgram, "u_scale" ), 1.5f );
-   glUniform1i( glGetUniformLocation( renderProgram, "u_instanceOffset" ), n );
-   glDrawElementsInstanced( GL_TRIANGLES, 12, GL_UNSIGNED_INT, 0, 1 );
+   // Draw predators: red, large
+   int np = boid_gui.numPredators;
+   if( np > 0 )
+   {
+      glUniform4f( glGetUniformLocation( renderProgram, "u_color" ), 0.85f, 0.15f, 0.15f, 1.0f );
+      glUniform1f( glGetUniformLocation( renderProgram, "u_scale" ), 1.5f );
+      glUniform1i( glGetUniformLocation( renderProgram, "u_instanceOffset" ), n );
+      glDrawElementsInstanced( GL_TRIANGLES, 12, GL_UNSIGNED_INT, 0, np );
+   }
 
    glBindVertexArray( 0 );
    glUseProgram( 0 );
@@ -792,24 +814,7 @@ void Aftr::GLViewBoidSwarm::loadMap()
       }
    }
 
-   // ---- Translucent aquarium sphere ----
-   {
-      this->aquarium = WO::New();
-      MGLIndexedGeometry* mglSphere = MGLIndexedGeometry::New( this->aquarium );
-      IndexedGeometrySphereTriStrip* geoSphere = IndexedGeometrySphereTriStrip::New(
-         boid_gui.boundaryRadius, 32, 32, true, true );
-      mglSphere->setIndexedGeometry( geoSphere );
-      this->aquarium->setModel( mglSphere );
-      this->aquarium->setPosition( Vector( 0, 0, 0 ) );
-      this->aquarium->renderOrderType = RENDER_ORDER_TYPE::roTRANSPARENT;
-      this->aquarium->setLabel( "Aquarium" );
-
-      // Semi-transparent blue tint
-      this->aquarium->getModel()->getSkin().setAmbient( aftrColor4f( 0.2f, 0.4f, 0.7f, 0.12f ) );
-      this->aquarium->getModel()->getSkin().setDiffuse( aftrColor4f( 0.3f, 0.5f, 0.8f, 0.12f ) );
-
-      this->worldLst->push_back( this->aquarium );
-   }
+   // (Aquarium sphere removed — boundary containment still active in compute shader)
 
    // ---- ImGui ----
    {

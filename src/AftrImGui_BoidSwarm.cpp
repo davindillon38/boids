@@ -19,7 +19,9 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
 
       ImGui::Separator();
       ImGui::Text( "Swarm Size" );
-      if( ImGui::SliderInt( "Num Boids", &this->numBoids, 100, 5000 ) )
+      if( ImGui::SliderInt( "Num Boids", &this->numBoids, 100, 20000 ) )
+         this->resetRequested = true;
+      if( ImGui::SliderInt( "Num Predators", &this->numPredators, 0, 10 ) )
          this->resetRequested = true;
 
       ImGui::Separator();
@@ -43,6 +45,9 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
       ImGui::Text( "Speed" );
       ImGui::SliderFloat( "Max Boid Speed", &this->maxSpeed, 0.05f, 1.0f );
       ImGui::SliderFloat( "Predator Speed", &this->predatorSpeed, 0.05f, 0.8f );
+
+      ImGui::Separator();
+      ImGui::Checkbox( "Show Obstacles", &this->showObstacles );
 
       ImGui::End();
    }

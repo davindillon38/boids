@@ -31,12 +31,14 @@ public:
    float maxSpeed = 0.3f;
    float predatorSpeed = 0.45f;
 
-   // Boid count
+   // Boid / predator count
    int numBoids = 1000;
+   int numPredators = 1;
 
    // Simulation control
    bool isPaused = false;
    bool resetRequested = false;
+   bool showObstacles = true;
 
 private:
    void draw_boid_controls();

@@ -14,11 +14,12 @@ public:
 
    // Flocking weights
    float separationWeight = 1.5f;
-   float alignmentWeight = 1.0f;
-   float cohesionWeight = 1.0f;
-   float boundaryWeight = 2.0f;
+   float alignmentWeight = 2.0f;
+   float cohesionWeight = 1.2f;
+   float boundaryWeight = 1.0f;
    float fleeWeight = 3.0f;
    float obstacleWeight = 3.0f;
+   float noiseStrength = 0.4f;
 
    // Radii
    float separationRadius = 2.0f;
@@ -28,7 +29,7 @@ public:
 
    // Speeds
    float maxSpeed = 0.3f;
-   float predatorSpeed = 0.15f;
+   float predatorSpeed = 0.45f;
 
    // Boid count
    int numBoids = 1000;

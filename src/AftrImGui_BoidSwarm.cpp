@@ -30,6 +30,7 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
       ImGui::SliderFloat( "Boundary", &this->boundaryWeight, 0.0f, 10.0f );
       ImGui::SliderFloat( "Flee", &this->fleeWeight, 0.0f, 10.0f );
       ImGui::SliderFloat( "Obstacle", &this->obstacleWeight, 0.0f, 10.0f );
+      ImGui::SliderFloat( "Noise", &this->noiseStrength, 0.0f, 2.0f );
 
       ImGui::Separator();
       ImGui::Text( "Radii" );
@@ -41,7 +42,7 @@ void Aftr::AftrImGui_BoidSwarm::draw_boid_controls()
       ImGui::Separator();
       ImGui::Text( "Speed" );
       ImGui::SliderFloat( "Max Boid Speed", &this->maxSpeed, 0.05f, 1.0f );
-      ImGui::SliderFloat( "Predator Speed", &this->predatorSpeed, 0.02f, 0.5f );
+      ImGui::SliderFloat( "Predator Speed", &this->predatorSpeed, 0.05f, 0.8f );
 
       ImGui::End();
    }

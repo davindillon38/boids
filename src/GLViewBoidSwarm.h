@@ -55,12 +55,16 @@ protected:
    // Aquarium sphere
    WO* aquarium = nullptr;
 
-   // Obstacles
-   static constexpr int NUM_OBSTACLES = 3;
+   // Obstacles (vertical pillars)
+   static constexpr int NUM_OBSTACLES = 5;
    Vector obstaclePositions[NUM_OBSTACLES] = {
-      Vector( 8, 0, 0 ), Vector( -5, 8, -3 ), Vector( 0, -6, 5 )
+      Vector( 0, 0, 0 ),       // center pillar
+      Vector( 10, 8, 0 ),      // front-right
+      Vector( -10, 8, 0 ),     // front-left
+      Vector( -7, -10, 0 ),    // back-left
+      Vector( 8, -9, 0 )       // back-right
    };
-   float obstacleAvoidRadius = 5.0f;
+   float obstacleAvoidRadius = 4.0f;
    WO* obstacleWOs[NUM_OBSTACLES] = {};
 };
 

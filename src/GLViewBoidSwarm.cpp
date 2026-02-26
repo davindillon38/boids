@@ -23,6 +23,8 @@
 #include "AftrGLRendererBase.h"
 #include "MGLIndexedGeometry.h"
 #include "IndexedGeometrySphereTriStrip.h"
+#include "IndexedGeometryTriangles.h"
+#include "IndexedGeometryCylinder.h"
 #include "ManagerEnvironmentConfiguration.h"
 
 #include <cstdlib>
@@ -63,8 +65,27 @@ uniform float u_bndRadius;
 uniform float u_maxSpeed;
 uniform float u_predSpeed;
 uniform float u_dt;
+uniform float u_noiseStrength;
+uniform int   u_frame;
+uniform float u_eatRadius;
 uniform int   u_numObstacles;
-uniform vec4  u_obstacles[3]; // xyz=position, w=avoidance radius
+uniform vec4  u_obstacles[5]; // xyz=position, w=avoidance radius
+
+// Hash-based pseudo-random noise (returns vec3 in roughly -1..1)
+vec3 hash3( uint seed ) {
+    uint s = seed;
+    s ^= s >> 16u; s *= 0x45d9f3bu;
+    s ^= s >> 16u; s *= 0x45d9f3bu;
+    s ^= s >> 16u;
+    float x = float(s & 0xFFFFu) / 32767.5 - 1.0;
+    s *= 0x9E3779B9u;
+    s ^= s >> 16u;
+    float y = float(s & 0xFFFFu) / 32767.5 - 1.0;
+    s *= 0x9E3779B9u;
+    s ^= s >> 16u;
+    float z = float(s & 0xFFFFu) / 32767.5 - 1.0;
+    return vec3(x, y, z);
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -76,14 +97,20 @@ void main() {
     bool isPredator = (idx == uint(u_numBoids));
 
     vec3 acc = vec3(0.0);
+    float velW = 0.0; // used by predator to persist locked target index
 
     if (!isPredator) {
         // ---- Boid flocking rules ----
         vec3 separation = vec3(0.0);
         vec3 alignSum   = vec3(0.0);
         vec3 cohesionSum = vec3(0.0);
+        float cohesionWSum = 0.0;
         int sepCount = 0;
         int neiCount = 0;
+
+        // Forward direction for directional cohesion
+        float mySpeed = length(myVel);
+        vec3 fwd = (mySpeed > 0.001) ? (myVel / mySpeed) : vec3(1, 0, 0);
 
         for (uint j = 0u; j < uint(u_numBoids); ++j) {
             if (j == idx) continue;
@@ -100,8 +127,15 @@ void main() {
 
             // Alignment + Cohesion
             if (dist < u_neiRadius) {
-                alignSum   += boidsIn[j].vel.xyz;
-                cohesionSum += other;
+                alignSum += boidsIn[j].vel.xyz;
+
+                // Directional cohesion: neighbors ahead pull strongly,
+                // neighbors behind pull weakly — creates tadpole shape
+                vec3 toOther = -diff / dist;
+                float forwardness = dot(fwd, toOther); // -1 (behind) to +1 (ahead)
+                float w = 0.15 + 0.85 * clamp(forwardness * 0.5 + 0.5, 0.0, 1.0);
+                cohesionSum += other * w;
+                cohesionWSum += w;
                 neiCount++;
             }
         }
@@ -113,15 +147,17 @@ void main() {
             vec3 avgVel = alignSum / float(neiCount);
             acc += (avgVel - myVel) * u_aliWeight;
 
-            vec3 center = cohesionSum / float(neiCount);
+            vec3 center = cohesionSum / cohesionWSum;
             acc += (center - myPos) * u_cohWeight;
         }
 
-        // Boundary containment
+        // Boundary containment (soft ramp starting at 70% of radius)
         float distOrigin = length(myPos);
-        if (distOrigin > u_bndRadius) {
-            float overshoot = distOrigin - u_bndRadius;
-            acc += (-myPos / distOrigin) * overshoot * u_bndWeight;
+        float softEdge = u_bndRadius * 0.7;
+        if (distOrigin > softEdge) {
+            float t = (distOrigin - softEdge) / (u_bndRadius - softEdge); // 0..1 ramp
+            t = clamp(t, 0.0, 1.0);
+            acc += (-myPos / distOrigin) * t * t * u_bndWeight; // quadratic falloff
         }
 
         // Predator avoidance
@@ -145,6 +181,10 @@ void main() {
             }
         }
 
+        // Random jitter — breaks up perfectly uniform formations
+        vec3 noise = hash3( idx * 1777u + uint(u_frame) * 3571u ) * u_noiseStrength;
+        acc += noise;
+
         // Integrate
         myVel += acc * u_dt;
         float speed = length(myVel);
@@ -153,17 +193,47 @@ void main() {
         else if (speed < u_maxSpeed * 0.1 && speed > 0.0001)
             myVel = normalize(myVel) * u_maxSpeed * 0.1; // minimum speed so boids keep swimming
 
-    } else {
-        // ---- Predator: chase flock centroid ----
-        vec3 centroid = vec3(0.0);
-        for (uint j = 0u; j < uint(u_numBoids); ++j)
-            centroid += boidsIn[j].pos.xyz;
-        centroid /= float(u_numBoids);
+        // Eaten by predator — respawn at random location
+        if (predDist < u_eatRadius) {
+            vec3 rng = hash3( idx * 7919u + uint(u_frame) * 6271u + 12345u );
+            myPos = normalize(rng) * u_bndRadius * 0.6;
+            myVel = hash3( idx * 3571u + uint(u_frame) * 1777u + 54321u ) * u_maxSpeed * 0.5;
+        }
 
-        vec3 toCentroid = centroid - myPos;
-        float dist = length(toCentroid);
+    } else {
+        // ---- Predator: lock onto boid near swarm center ----
+        // Compute flock centroid
+        vec3 flockCenter = vec3(0.0);
+        for (uint j = 0u; j < uint(u_numBoids); ++j)
+            flockCenter += boidsIn[j].pos.xyz;
+        flockCenter /= float(u_numBoids);
+
+        // Read locked target from vel.w (persisted across frames)
+        int lockedTarget = int(boidsIn[idx].vel.w);
+
+        // Re-evaluate every 300 frames (~5s at 60fps), on invalid target,
+        // or if current target drifted far from swarm (was eaten/respawned)
+        bool retarget = (u_frame % 300 == 0)
+                     || lockedTarget < 0
+                     || lockedTarget >= u_numBoids
+                     || length(boidsIn[lockedTarget].pos.xyz - flockCenter) > u_bndRadius * 0.5;
+
+        if (retarget) {
+            float nearestDist = 1e20;
+            for (uint j = 0u; j < uint(u_numBoids); ++j) {
+                float d = length(boidsIn[j].pos.xyz - flockCenter);
+                if (d < nearestDist) {
+                    nearestDist = d;
+                    lockedTarget = int(j);
+                }
+            }
+        }
+
+        vec3 targetPos = boidsIn[lockedTarget].pos.xyz;
+        vec3 toTarget = targetPos - myPos;
+        float dist = length(toTarget);
         if (dist > 0.01)
-            acc = normalize(toCentroid) * 0.5;
+            acc = normalize(toTarget) * 0.5;
 
         // Boundary
         float distOrigin = length(myPos);
@@ -172,28 +242,20 @@ void main() {
             acc += (-myPos / distOrigin) * overshoot * u_bndWeight;
         }
 
-        // Obstacle avoidance
-        for (int o = 0; o < u_numObstacles; ++o) {
-            vec3  obsPos    = u_obstacles[o].xyz;
-            float obsRadius = u_obstacles[o].w;
-            vec3  obsDiff   = myPos - obsPos;
-            float obsDist   = length(obsDiff);
-            if (obsDist < obsRadius && obsDist > 0.001) {
-                float strength = (obsRadius - obsDist) / obsDist;
-                acc += normalize(obsDiff) * strength * u_obsWeight;
-            }
-        }
+        // Predator ignores obstacles — plows right through
 
         myVel += acc * u_dt;
         float speed = length(myVel);
         if (speed > u_predSpeed)
             myVel = normalize(myVel) * u_predSpeed;
+
+        velW = float(lockedTarget); // persist target index
     }
 
     myPos += myVel;
 
     boidsOut[idx].pos = vec4(myPos, boidsIn[idx].pos.w);
-    boidsOut[idx].vel = vec4(myVel, 0.0);
+    boidsOut[idx].vel = vec4(myVel, velW);
 }
 )";
 
@@ -321,6 +383,41 @@ static Vector randVecInSphere( float radius )
       v = Vector( randFloat( -1, 1 ), randFloat( -1, 1 ), randFloat( -1, 1 ) );
    } while( v.x * v.x + v.y * v.y + v.z * v.z > 1.0f );
    return Vector( v.x * radius, v.y * radius, v.z * radius );
+}
+
+// Generate torus mesh (ring shape) as vertex + index lists
+static void generateTorus( float majorR, float minorR, int majorSegs, int minorSegs,
+                           std::vector<Vector>& verts, std::vector<unsigned int>& indices )
+{
+   verts.clear();
+   indices.clear();
+   const float PI2 = 2.0f * 3.14159265f;
+
+   for( int i = 0; i <= majorSegs; ++i )
+   {
+      float theta = PI2 * i / majorSegs;
+      float ct = cosf( theta ), st = sinf( theta );
+      for( int j = 0; j <= minorSegs; ++j )
+      {
+         float phi = PI2 * j / minorSegs;
+         float cp = cosf( phi ), sp = sinf( phi );
+         float x = ( majorR + minorR * cp ) * ct;
+         float y = ( majorR + minorR * cp ) * st;
+         float z = minorR * sp;
+         verts.push_back( Vector( x, y, z ) );
+      }
+   }
+
+   for( int i = 0; i < majorSegs; ++i )
+   {
+      for( int j = 0; j < minorSegs; ++j )
+      {
+         unsigned int a = i * ( minorSegs + 1 ) + j;
+         unsigned int b = a + minorSegs + 1;
+         indices.push_back( a ); indices.push_back( b ); indices.push_back( a + 1 );
+         indices.push_back( a + 1 ); indices.push_back( b ); indices.push_back( b + 1 );
+      }
+   }
 }
 
 // GPU-side boid data (matches GLSL struct layout)
@@ -492,6 +589,12 @@ void GLViewBoidSwarm::updateWorld()
    if( boid_gui.isPaused )
       return;
 
+   // Skip compute dispatch if shader failed to compile/link
+   GLint computeLinked = 0;
+   glGetProgramiv( computeProgram, GL_LINK_STATUS, &computeLinked );
+   if( !computeLinked )
+      return;
+
    int n = boid_gui.numBoids;
    int writeIdx = 1 - readIdx;
 
@@ -512,6 +615,12 @@ void GLViewBoidSwarm::updateWorld()
    glUniform1f( glGetUniformLocation( computeProgram, "u_maxSpeed" ),  boid_gui.maxSpeed );
    glUniform1f( glGetUniformLocation( computeProgram, "u_predSpeed" ), boid_gui.predatorSpeed );
    glUniform1f( glGetUniformLocation( computeProgram, "u_dt" ),        0.05f );
+   glUniform1f( glGetUniformLocation( computeProgram, "u_noiseStrength" ), boid_gui.noiseStrength );
+
+   glUniform1f( glGetUniformLocation( computeProgram, "u_eatRadius" ), 1.5f );
+
+   static int frameCounter = 0;
+   glUniform1i( glGetUniformLocation( computeProgram, "u_frame" ), frameCounter++ );
 
    // Obstacle uniforms
    glUniform1i( glGetUniformLocation( computeProgram, "u_numObstacles" ), NUM_OBSTACLES );
@@ -532,29 +641,6 @@ void GLViewBoidSwarm::updateWorld()
 
    // Barrier: ensure compute writes are visible to subsequent reads
    glMemoryBarrier( GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT );
-
-   // One-time diagnostic: read back a boid position to verify compute is running
-   static int debugFrameCount = 0;
-   if( debugFrameCount < 3 )
-   {
-      glBindBuffer( GL_SHADER_STORAGE_BUFFER, ssbo[writeIdx] );
-      BoidGPU* mapped = (BoidGPU*)glMapBufferRange( GL_SHADER_STORAGE_BUFFER, 0,
-                        3 * sizeof( BoidGPU ), GL_MAP_READ_BIT );
-      if( mapped )
-      {
-         std::cout << "Frame " << debugFrameCount << " compute output boid[0]: pos=("
-                   << mapped[0].px << "," << mapped[0].py << "," << mapped[0].pz
-                   << ") vel=(" << mapped[0].vx << "," << mapped[0].vy << "," << mapped[0].vz
-                   << ")" << std::endl;
-         glUnmapBuffer( GL_SHADER_STORAGE_BUFFER );
-      }
-      else
-      {
-         std::cout << "Frame " << debugFrameCount << " FAILED to map SSBO for readback!" << std::endl;
-      }
-      glBindBuffer( GL_SHADER_STORAGE_BUFFER, 0 );
-      debugFrameCount++;
-   }
 
    // Swap buffers
    readIdx = writeIdx;
@@ -675,33 +761,32 @@ void Aftr::GLViewBoidSwarm::loadMap()
       worldLst->push_back( light );
    }
 
-   // ---- SkyBox (water theme) ----
-   {
-      std::string skyBox = ManagerEnvironmentConfiguration::getSMM() + "/images/skyboxes/sky_water+6.jpg";
-      WO* wo = WOSkyBox::New( skyBox, this->getCameraPtrPtr() );
-      wo->setPosition( Vector( 0, 0, 0 ) );
-      wo->setLabel( "Sky Box" );
-      wo->renderOrderType = RENDER_ORDER_TYPE::roOPAQUE;
-      worldLst->push_back( wo );
-   }
+   // ---- Solid dark background (no skybox) ----
+   glClearColor( 0.05f, 0.05f, 0.12f, 1.0f );
 
-   // ---- Obstacle boxes ----
+   // ---- Obstacle pillars (tall cylinders) ----
    {
-      std::string cubeModel = ManagerEnvironmentConfiguration::getSMM() + "/models/cube4x4x4redShinyPlastic_pp.wrl";
+      float pillarHeight = 40.0f;  // tall enough to span the aquarium vertically
+      float pillarRadius = 2.0f;
+
       for( int i = 0; i < NUM_OBSTACLES; ++i )
       {
-         WO* obs = WO::New( cubeModel, Vector( 1.5f, 1.5f, 1.5f ), MESH_SHADING_TYPE::mstFLAT );
+         WO* obs = WO::New();
+         MGLIndexedGeometry* mgl = MGLIndexedGeometry::New( obs );
+         IndexedGeometryCylinder* cyl = IndexedGeometryCylinder::New(
+            pillarRadius, pillarRadius, pillarHeight, 16, 1, true, false );
+         mgl->setIndexedGeometry( cyl );
+         obs->setModel( mgl );
          obs->setPosition( obstaclePositions[i] );
-         obs->renderOrderType = RENDER_ORDER_TYPE::roOPAQUE;
-         obs->upon_async_model_loaded( [obs]()
-            {
-               ModelMeshSkin& skin = obs->getModel()->getModelDataShared()->getModelMeshes().at( 0 )->getSkins().at( 0 );
-               skin.setAmbient( aftrColor4f( 0.15f, 0.35f, 0.15f, 1.0f ) );
-               skin.setDiffuse( aftrColor4f( 0.2f, 0.5f, 0.25f, 1.0f ) );
-               skin.setSpecular( aftrColor4f( 0.1f, 0.2f, 0.1f, 1.0f ) );
-               skin.setSpecularCoefficient( 5 );
-            } );
-         obs->setLabel( "Obstacle" );
+         obs->renderOrderType = RENDER_ORDER_TYPE::roTRANSPARENT;
+
+         // Semi-transparent coral color (alpha ~0.35)
+         obs->getModel()->getSkin().setAmbient( aftrColor4f( 0.5f, 0.25f, 0.15f, 0.35f ) );
+         obs->getModel()->getSkin().setDiffuse( aftrColor4f( 0.7f, 0.35f, 0.2f, 0.35f ) );
+         obs->getModel()->getSkin().setSpecular( aftrColor4f( 0.3f, 0.2f, 0.1f, 0.35f ) );
+         obs->getModel()->getSkin().setSpecularCoefficient( 10 );
+
+         obs->setLabel( "Pillar" );
          worldLst->push_back( obs );
          obstacleWOs[i] = obs;
       }
